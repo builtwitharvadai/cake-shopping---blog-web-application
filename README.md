@@ -9,6 +9,8 @@ A modern, full-stack e-commerce platform for cake shopping with an integrated bl
 - **Responsive Design**: Mobile-first approach with Tailwind CSS utility classes
 - **Code Quality**: ESLint and Prettier configured for consistent code style
 - **Production Ready**: Optimized build configuration for deployment
+- **CI/CD Pipeline**: Automated testing, security scanning, and multi-environment deployment
+- **Containerized**: Docker support with Kubernetes orchestration
 
 ## 📋 Prerequisites
 
