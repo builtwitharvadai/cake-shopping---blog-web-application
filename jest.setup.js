@@ -1,3 +1,7 @@
+import { TextEncoder, TextDecoder } from 'util';
+global.TextEncoder = TextEncoder;
+global.TextDecoder = TextDecoder;
+
 import '@testing-library/jest-dom';
 import { Request, Response, Headers, FormData } from 'undici';
 
