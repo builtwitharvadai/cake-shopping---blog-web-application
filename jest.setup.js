@@ -1,4 +1,5 @@
-import { TextEncoder, TextDecoder } from 'util';
+// Polyfill TextEncoder/TextDecoder for Jest environment (required by undici)
+const { TextEncoder, TextDecoder } = require('util');
 global.TextEncoder = TextEncoder;
 global.TextDecoder = TextDecoder;
 
