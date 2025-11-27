@@ -1,0 +1,395 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-version: ${{ steps.meta.outputs.version }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=${{ github.repository }}
+            org.opencontainers.image.description=Cake Shopping & Blog Web Application
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+      
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+      
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  deploy-development:
+    name: Deploy to Development
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'development'
+    
+    environment:
+      name: development
+      url: https://dev.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+      
+      - name: Update deployment image
+        run: |
+          kubectl set image deployment/cake-shop-deployment \
+            cake-shop=${{ needs.build-and-push.outputs.image-tag }} \
+            -n development \
+            --record
+          
+          kubectl annotate deployment/cake-shop-deployment \
+            kubernetes.io/change-cause="Deploy version ${{ needs.build-and-push.outputs.image-version }} from commit ${{ github.sha }}" \
+            -n development
+      
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/configmap.yaml -n development
+          kubectl apply -f k8s/service.yaml -n development
+          kubectl apply -f k8s/deployment.yaml -n development
+          kubectl apply -f k8s/hpa.yaml -n development
+          kubectl apply -f k8s/pdb.yaml -n development
+          kubectl apply -f k8s/ingress.yaml -n development
+      
+      - name: Wait for rollout to complete
+        run: |
+          kubectl rollout status deployment/cake-shop-deployment -n development --timeout=10m
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n development -l app=cake-shop
+          kubectl get svc -n development -l app=cake-shop
+      
+      - name: Run health checks
+        run: |
+          for i in {1..30}; do
+            STATUS=$(kubectl get pods -n development -l app=cake-shop -o jsonpath='{.items[0].status.phase}')
+            if [ "$STATUS" == "Running" ]; then
+              echo "Pod is running, checking health endpoint..."
+              POD_NAME=$(kubectl get pods -n development -l app=cake-shop -o jsonpath='{.items[0].metadata.name}')
+              HEALTH_STATUS=$(kubectl exec -n development $POD_NAME -- wget -q -O- http://localhost:3000/api/health || echo "failed")
+              if [[ "$HEALTH_STATUS" == *"healthy"* ]] || [[ "$HEALTH_STATUS" == *"ok"* ]]; then
+                echo "Health check passed"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i: Pod status is $STATUS, retrying..."
+            sleep 10
+          done
+          echo "Health check failed after 30 attempts"
+          exit 1
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed, rolling back..."
+          kubectl rollout undo deployment/cake-shop-deployment -n development
+          kubectl rollout status deployment/cake-shop-deployment -n development --timeout=5m
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-development]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'staging'
+    
+    environment:
+      name: staging
+      url: https://staging.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+      
+      - name: Update deployment image
+        run: |
+          kubectl set image deployment/cake-shop-deployment \
+            cake-shop=${{ needs.build-and-push.outputs.image-tag }} \
+            -n staging \
+            --record
+          
+          kubectl annotate deployment/cake-shop-deployment \
+            kubernetes.io/change-cause="Deploy version ${{ needs.build-and-push.outputs.image-version }} from commit ${{ github.sha }}" \
+            -n staging
+      
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/configmap.yaml -n staging
+          kubectl apply -f k8s/service.yaml -n staging
+          kubectl apply -f k8s/deployment.yaml -n staging
+          kubectl apply -f k8s/hpa.yaml -n staging
+          kubectl apply -f k8s/pdb.yaml -n staging
+          kubectl apply -f k8s/ingress.yaml -n staging
+      
+      - name: Wait for rollout to complete
+        run: |
+          kubectl rollout status deployment/cake-shop-deployment -n staging --timeout=10m
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n staging -l app=cake-shop
+          kubectl get svc -n staging -l app=cake-shop
+      
+      - name: Run health checks
+        run: |
+          for i in {1..30}; do
+            STATUS=$(kubectl get pods -n staging -l app=cake-shop -o jsonpath='{.items[0].status.phase}')
+            if [ "$STATUS" == "Running" ]; then
+              echo "Pod is running, checking health endpoint..."
+              POD_NAME=$(kubectl get pods -n staging -l app=cake-shop -o jsonpath='{.items[0].metadata.name}')
+              HEALTH_STATUS=$(kubectl exec -n staging $POD_NAME -- wget -q -O- http://localhost:3000/api/health || echo "failed")
+              if [[ "$HEALTH_STATUS" == *"healthy"* ]] || [[ "$HEALTH_STATUS" == *"ok"* ]]; then
+                echo "Health check passed"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i: Pod status is $STATUS, retrying..."
+            sleep 10
+          done
+          echo "Health check failed after 30 attempts"
+          exit 1
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed, rolling back..."
+          kubectl rollout undo deployment/cake-shop-deployment -n staging
+          kubectl rollout status deployment/cake-shop-deployment -n staging --timeout=5m
+
+  deploy-production:
+    name: Deploy to Production (Blue-Green)
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-staging]
+    if: github.ref == 'refs/heads/main' || github.event.inputs.environment == 'production'
+    
+    environment:
+      name: production
+      url: https://app.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG }}
+      
+      - name: Determine active and inactive deployments
+        id: colors
+        run: |
+          ACTIVE_COLOR=$(kubectl get svc cake-shop-service-active -n production -o jsonpath='{.spec.selector.color}' 2>/dev/null || echo "blue")
+          if [ "$ACTIVE_COLOR" == "blue" ]; then
+            NEW_COLOR="green"
+          else
+            NEW_COLOR="blue"
+          fi
+          
+          echo "active_color=$ACTIVE_COLOR" >> $GITHUB_OUTPUT
+          echo "new_color=$NEW_COLOR" >> $GITHUB_OUTPUT
+          
+          echo "Current active deployment: $ACTIVE_COLOR"
+          echo "Deploying to: $NEW_COLOR"
+      
+      - name: Deploy to inactive (green) environment
+        run: |
+          NEW_COLOR="${{ steps.colors.outputs.new_color }}"
+          
+          kubectl set image deployment/cake-shop-deployment-$NEW_COLOR \
+            cake-shop=${{ needs.build-and-push.outputs.image-tag }} \
+            -n production \
+            --record
+          
+          kubectl annotate deployment/cake-shop-deployment-$NEW_COLOR \
+            kubernetes.io/change-cause="Deploy version ${{ needs.build-and-push.outputs.image-version }} from commit ${{ github.sha }}" \
+            -n production
+      
+      - name: Wait for green deployment rollout
+        run: |
+          NEW_COLOR="${{ steps.colors.outputs.new_color }}"
+          kubectl rollout status deployment/cake-shop-deployment-$NEW_COLOR -n production --timeout=15m
+      
+      - name: Run health checks on green deployment
+        run: |
+          NEW_COLOR="${{ steps.colors.outputs.new_color }}"
+          
+          for i in {1..30}; do
+            STATUS=$(kubectl get pods -n production -l app=cake-shop,color=$NEW_COLOR -o jsonpath='{.items[0].status.phase}')
+            if [ "$STATUS" == "Running" ]; then
+              echo "Pod is running, checking health endpoint..."
+              POD_NAME=$(kubectl get pods -n production -l app=cake-shop,color=$NEW_COLOR -o jsonpath='{.items[0].metadata.name}')
+              HEALTH_STATUS=$(kubectl exec -n production $POD_NAME -- wget -q -O- http://localhost:3000/api/health || echo "failed")
+              if [[ "$HEALTH_STATUS" == *"healthy"* ]] || [[ "$HEALTH_STATUS" == *"ok"* ]]; then
+                echo "Health check passed on $NEW_COLOR deployment"
+                exit 0
+              fi
+            fi
+            echo "Attempt $i: Pod status is $STATUS, retrying..."
+            sleep 10
+          done
+          echo "Health check failed on $NEW_COLOR deployment after 30 attempts"
+          exit 1
+      
+      - name: Switch traffic to green deployment
+        run: |
+          NEW_COLOR="${{ steps.colors.outputs.new_color }}"
+          
+          kubectl patch svc cake-shop-service-active -n production \
+            -p "{\"spec\":{\"selector\":{\"app\":\"cake-shop\",\"color\":\"$NEW_COLOR\"}}}"
+          
+          echo "Traffic switched to $NEW_COLOR deployment"
+      
+      - name: Monitor production deployment
+        run: |
+          echo "Monitoring deployment for 120 seconds..."
+          sleep 120
+          
+          for i in {1..10}; do
+            POD_NAME=$(kubectl get pods -n production -l app=cake-shop,color=${{ steps.colors.outputs.new_color }} -o jsonpath='{.items[0].metadata.name}')
+            HEALTH_STATUS=$(kubectl exec -n production $POD_NAME -- wget -q -O- http://localhost:3000/api/health || echo "failed")
+            if [[ "$HEALTH_STATUS" != *"healthy"* ]] && [[ "$HEALTH_STATUS" != *"ok"* ]]; then
+              echo "Health check failed during monitoring"
+              exit 1
+            fi
+            echo "Health check $i passed"
+            sleep 10
+          done
+          
+          echo "Production deployment stable"
+      
+      - name: Update blue deployment for next cycle
+        if: success()
+        run: |
+          PREVIOUS_COLOR="${{ steps.colors.outputs.active_color }}"
+          
+          kubectl set image deployment/cake-shop-deployment-$PREVIOUS_COLOR \
+            cake-shop=${{ needs.build-and-push.outputs.image-tag }} \
+            -n production \
+            --record
+          
+          echo "Updated $PREVIOUS_COLOR deployment to match ${{ steps.colors.outputs.new_color }}"
+      
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          PREVIOUS_COLOR="${{ steps.colors.outputs.active_color }}"
+          
+          echo "Deployment failed, rolling back to $PREVIOUS_COLOR"
+          
+          kubectl patch svc cake-shop-service-active -n production \
+            -p "{\"spec\":{\"selector\":{\"app\":\"cake-shop\",\"color\":\"$PREVIOUS_COLOR\"}}}"
+          
+          echo "Rolled back to $PREVIOUS_COLOR deployment"
+      
+      - name: Create GitHub release
+        if: success()
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ needs.build-and-push.outputs.image-version }}
+          release_name: Release v${{ needs.build-and-push.outputs.image-version }}
+          body: |
+            ## Production Deployment
+            
+            - Image: ${{ needs.build-and-push.outputs.image-tag }}
+            - Commit: ${{ github.sha }}
+            - Strategy: Blue-Green
+            - Active Color: ${{ steps.colors.outputs.new_color }}
+            
+            ## Deployment Details
+            
+            - Environment: Production
+            - Timestamp: ${{ github.event.head_commit.timestamp }}
+            - Deployed by: ${{ github.actor }}
+          draft: false
+          prerelease: false
