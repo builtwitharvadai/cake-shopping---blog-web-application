@@ -8,7 +8,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "format": "prettier --write \"**/*.{js,jsx,ts,tsx,json,css,md}\""
+    "format": "prettier --write \"**/*.{js,jsx,ts,tsx,json,css,md}\"",
+    "test": "jest --coverage",
+    "test:ci": "jest --coverage --ci --maxWorkers=2"
   },
   "dependencies": {
     "next": "^14.2.0",
